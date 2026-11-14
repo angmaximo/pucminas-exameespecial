@@ -1,9 +1,13 @@
 terraform {
-  required_version = ">= 1.5.0"
+  # Caso queira usar backend remoto, descomente e configure seu bucket:
+  # backend "gcs" {
+  #   bucket = "SEU-BUCKET-TFSTATE"
+  #   prefix = "terraform/state/exame-especial"
+  # }
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
   }
 }
@@ -14,32 +18,34 @@ provider "google" {
 }
 
 variable "project_id" {
-  type    = string
-  default = "puc-serverless-ia"
+  description = "ID do projeto no Google Cloud"
+  type        = string
+  default     = "meu-projeto-puc"
 }
 
 variable "region" {
-  type    = string
-  default = "us-central1"
+  description = "Região padrão dos recursos serverless"
+  type        = string
+  default     = "us-central1"
 }
 
-# -----------------------------------------------------------------------------
-# ETAPA 1: Tópico Pub/Sub principal, DLQ e Política de Dead-Letter
-# -----------------------------------------------------------------------------
-resource "google_pubsub_topic" "build_failures_dlq" {
-  name = "build-failures-dlq"
+resource "random_id" "bucket_suffix" {
+  byte_length = 4
 }
 
-resource "google_pubsub_subscription" "build_failures_dlq_sub" {
-  name  = "build-failures-dlq-sub"
-  topic = google_pubsub_topic.build_failures_dlq.name
-}
-
+# 1. Tópico Pub/Sub principal de falhas de build que acionará o Agente
 resource "google_pubsub_topic" "build_failures" {
   name = "build-failures"
 }
 
-resource "google_pubsub_subscription" "build_failures_subscription" {
+# ============================================================================
+# TODO (Etapa 1 - 15 pts): Dead-Letter Queue (DLQ)
+# ============================================================================
+resource "google_pubsub_topic" "build_failures_dlq" {
+  name = "build-failures-dlq"
+}
+
+resource "google_pubsub_subscription" "build_failures_sub" {
   name  = "build-failures-sub"
   topic = google_pubsub_topic.build_failures.name
 
@@ -49,15 +55,55 @@ resource "google_pubsub_subscription" "build_failures_subscription" {
   }
 }
 
-# -----------------------------------------------------------------------------
-# ETAPA 3: Secret Manager e IAM de Menor Privilégio
-# -----------------------------------------------------------------------------
-resource "google_service_account" "triage_agent_sa" {
-  account_id   = "triage-agent-event-sa"
-  display_name = "Service Account for Intelligent Triage Agent"
+resource "google_pubsub_subscription" "build_failures_dlq_sub" {
+  name  = "build-failures-dlq-sub"
+  topic = google_pubsub_topic.build_failures_dlq.name
 }
 
-resource "google_secret_manager_secret" "oncall_secret" {
+
+# 2. Bucket e Código para a Função
+resource "google_storage_bucket" "function_bucket" {
+  name                        = "exame-especial-src-${random_id.bucket_suffix.hex}"
+  location                    = var.region
+  force_destroy               = true
+  uniform_bucket_level_access = true
+}
+
+data "archive_file" "function_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/src"
+  output_path = "${path.module}/function-source.zip"
+}
+
+resource "google_storage_bucket_object" "function_code" {
+  name   = "source-${data.archive_file.function_zip.output_md5}.zip"
+  bucket = google_storage_bucket.function_bucket.name
+  source = data.archive_file.function_zip.output_path
+}
+
+# 3. Service Account dedicada para o Agente Orientado a Eventos (Menor Privilégio)
+resource "google_service_account" "agent_sa" {
+  account_id   = "triage-agent-event-sa"
+  display_name = "Service Account do Agente de Triagem Event-Driven"
+}
+
+# 4. Permissões IAM necessárias
+resource "google_project_iam_member" "vertex_ai_user" {
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_service_account.agent_sa.email}"
+}
+
+resource "google_project_iam_member" "firestore_user" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.agent_sa.email}"
+}
+
+# ============================================================================
+# TODO (Etapa 3 - 10 pts): Secret Manager + IAM de Menor Privilégio
+# ============================================================================
+resource "google_secret_manager_secret" "oncall_webhook_secret" {
   secret_id = "oncall-webhook-secret"
   replication {
     auto {}
@@ -65,52 +111,59 @@ resource "google_secret_manager_secret" "oncall_secret" {
 }
 
 resource "google_secret_manager_secret_iam_member" "secret_accessor" {
-  secret_id = google_secret_manager_secret.oncall_secret.id
+  secret_id = google_secret_manager_secret.oncall_webhook_secret.id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.triage_agent_sa.email}"
+  member    = "serviceAccount:${google_service_account.agent_sa.email}"
 }
 
-# Permissão para acessar o Firestore
-resource "google_project_iam_member" "firestore_user" {
-  project = var.project_id
-  role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_service_account.triage_agent_sa.email}"
-}
 
-# -----------------------------------------------------------------------------
-# ETAPA 4: Configuração do Cloud Run / Cloud Function Gen 2 (Mitigação de Cold Start)
-# -----------------------------------------------------------------------------
-# Exemplo de configuração de serviço (Cloud Run / Function v2 Gen)
-resource "google_cloud_run_v2_service" "triage_agent_service" {
-  name     = "triage-agent-service"
+# 5. Cloud Function Gen 2 disparada por evento do Pub/Sub
+resource "google_cloudfunctions2_function" "triage_agent" {
+  name     = "triage-agent-event-driven"
   location = var.region
-  ingress  = "INGRESS_TRAFFIC_ALL"
-
-  template {
-    service_account = google_service_account.triage_agent_sa.email
-    
-    # Otimização de Cold Start: Mantém instâncias mínimas quentes
-    scaling {
-      min_instance_count = 1
-      max_instance_count = 10
-    }
-
-    containers {
-      image = "gcr.io/${var.project_id}/triage-agent:latest"
-      
-      resources {
-        limits = {
-          cpu    = "1"
-          memory = "512Mi"
-        }
-      }
-
-      # Injeção segura do Secret Manager como variável de ambiente
-      secret_environment_variables {
-        key        = "ONCALL_WEBHOOK_SECRET"
-        secret     = google_secret_manager_secret.oncall_secret.secret_id
-        version    = "latest"
+  build_config {
+    runtime     = "python312"
+    entry_point = "triage_agent_event_driven"
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_bucket.name
+        object = google_storage_bucket_object.function_code.name
       }
     }
   }
+  service_config {
+    # TODO (Etapa 4): Otimização de Cold Start e custos
+    min_instance_count = 1
+    max_instance_count = 5
+    available_memory   = "512Mi"
+    timeout_seconds    = 120
+    environment_variables = {
+      GCP_PROJECT = var.project_id
+      GCP_REGION  = var.region
+    }
+    service_account_email = google_service_account.agent_sa.email
+
+    # TODO (Etapa 3): Injeção do segredo do Secret Manager
+    secret_environment_variables {
+      key        = "ONCALL_WEBHOOK_SECRET"
+      project_id = var.project_id
+      secret_id  = google_secret_manager_secret.oncall_webhook_secret.secret_id
+      version    = "latest"
+    }
+  }
+  event_trigger {
+    event_type   = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic = google_pubsub_topic.build_failures.id
+    retry_policy = "RETRY_POLICY_RETRY"
+  }
+
+  depends_on = [
+    google_project_iam_member.vertex_ai_user,
+    google_project_iam_member.firestore_user,
+    google_secret_manager_secret_iam_member.secret_accessor
+  ]
+}
+
+output "topic_id" {
+  value = google_pubsub_topic.build_failures.id
 }
