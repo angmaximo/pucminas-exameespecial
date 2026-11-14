@@ -1,114 +1,264 @@
-import os
+import base64
 import json
-import sys
-from google.cloud import firestore
+import os
+import functions_framework
 import vertexai
-from vertexai.generative_models import GenerativeModel, Tool, FunctionDeclaration
+from google.cloud import firestore
+from vertexai.generative_models import (
+    FunctionDeclaration,
+    GenerativeModel,
+    Part,
+    Tool,
+)
 
-# Inicialização do Firestore e Vertex AI
-db = firestore.Client()
+# Inicialização global (fora do handler para reaproveitamento em Warm Starts)
+PROJECT_ID = os.environ.get("GCP_PROJECT")
+REGION = os.environ.get("GCP_REGION", "us-central1")
 
-# -----------------------------------------------------------------------------
-# ETAPA 4: Função Auxiliar de Logs Estruturados
-# -----------------------------------------------------------------------------
+_db_client = None
+
+
+def get_db():
+    """Retorna cliente Firestore reutilizando a conexão entre invocações (Warm Start)."""
+    global _db_client
+    if _db_client is None:
+        _db_client = firestore.Client()
+    return _db_client
+
+
+if PROJECT_ID:
+    vertexai.init(project=PROJECT_ID, location=REGION)
+
+
 def log_structured(severity: str, message: str, build_id: str = None, **kwargs):
-    log_entry = {
+    payload = {
         "severity": severity,
         "message": message,
+        "build_id": build_id,
+        **kwargs,
     }
-    if build_id:
-        log_entry["build_id"] = build_id
-    log_entry.update(kwargs)
-    print(json.dumps(log_entry), flush=True)
+    print(json.dumps(payload, ensure_ascii=False))
 
 
-# -----------------------------------------------------------------------------
-# ETAPA 1: Controle de Idempotência no Firestore
-# -----------------------------------------------------------------------------
-def check_idempotency(build_id: str) -> bool:
-    try:
-        doc_ref = db.collection("build_triages").document(build_id)
-        doc = doc_ref.get()
-        if doc.exists:
-            data = doc.to_dict()
-            if data.get("status") == "TRIAGED":
-                return True
-    except Exception as e:
-        log_structured("ERROR", f"Erro ao verificar idempotência: {str(e)}", build_id=build_id)
-    return False
-
-def save_triage_status(build_id: str, status: str, details: dict):
-    try:
-        doc_ref = db.collection("build_triages").document(build_id)
-        doc_ref.set({
-            "status": status,
-            "details": details,
-            "timestamp": firestore.SERVER_TIMESTAMP
-        }, merge=True)
-    except Exception as e:
-        log_structured("ERROR", f"Erro ao salvar status no Firestore: {str(e)}", build_id=build_id)
-
-
-# -----------------------------------------------------------------------------
-# ETAPA 2: Ferramentas Locais e Cenário de Teste (build-303)
-# -----------------------------------------------------------------------------
-def local_get_build_logs(build_id: str) -> str:
-    logs_db = {
-        "build-303": "CRITICAL: Database corruption detected in production cluster. Integrity checks failed on primary node storage.",
-        "build-101": "ERROR: ModuleNotFoundError: No module named 'fastapi'",
-        "build-202": "WARNING: Deprecated python version detected in build pipeline."
-    }
-    return logs_db.get(build_id, f"Logs not found for build {build_id}")
-
-def local_trigger_pipeline_retry(build_id: str) -> str:
-    log_structured("INFO", f"Pipeline retry acionado para o build {build_id}", build_id=build_id)
-    return f"Pipeline retry successfully triggered for build {build_id}."
-
-def local_notify_oncall_team(build_id: str, severity: str, error_summary: str) -> str:
-    webhook_url = os.environ.get("ONCALL_WEBHOOK_SECRET", "mock-webhook-url")
-    log_structured("WARNING", f"Alerta On-Call enviado para equipe de plantão", build_id=build_id, severity=severity, summary=error_summary)
-    return f"Incident ticket successfully opened for build {build_id} with severity {severity}."
-
-
-# Declarações de Ferramentas Vertex AI (Function Calling)
-get_build_logs_decl = FunctionDeclaration(
-    name="local_get_build_logs",
-    description="Obtém os logs brutos de um build específico a partir do seu ID.",
+# Declaração das Ferramentas
+get_build_logs_declaration = FunctionDeclaration(
+    name="get_build_logs",
+    description="Retorna os logs de erro de um build específico do Cloud Build. Use esta ferramenta para investigar as causas de falha.",
     parameters={
-        "type": "OBJECT",
-        "properties": {"build_id": {"type": "STRING", "description": "ID do build."}},
-        "required": ["build_id"]
-    }
-)
-
-trigger_pipeline_retry_decl = FunctionDeclaration(
-    name="local_trigger_pipeline_retry",
-    description="Reinicia a pipeline de CI/CD para o build especificado.",
-    parameters={
-        "type": "OBJECT",
-        "properties": {"build_id": {"type": "STRING", "description": "ID do build."}},
-        "required": ["build_id"]
-    }
-)
-
-notify_oncall_decl = FunctionDeclaration(
-    name="local_notify_oncall_team",
-    description="Aciona o time de plantão (on-call) enviando um alerta crítico com severidade e resumo do erro.",
-    parameters={
-        "type": "OBJECT",
+        "type": "object",
         "properties": {
-            "build_id": {"type": "STRING", "description": "ID do build."},
-            "severity": {"type": "STRING", "description": "Severidade do incidente (HIGH, CRITICAL)."},
-            "error_summary": {"type": "STRING", "description": "Resumo detalhado do erro."}
+            "build_id": {
+                "type": "string",
+                "description": "ID exclusivo do build que falhou.",
+            }
         },
-        "required": ["build_id", "severity", "error_summary"]
-    }
+        "required": ["build_id"],
+    },
+)
+
+trigger_pipeline_retry_declaration = FunctionDeclaration(
+    name="trigger_pipeline_retry",
+    description="Dispara uma reexecução (retry) automática do pipeline para o build fornecido. Use APENAS se o erro for transitório (ex: timeout, falha de conexão).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "build_id": {
+                "type": "string",
+                "description": "ID exclusivo do build que deve ser reexecutado.",
+            }
+        },
+        "required": ["build_id"],
+    },
+)
+
+# ============================================================================
+# ETAPA 2 (15 pts): Declaração da Nova Ferramenta (`notify_oncall_team`)
+# ============================================================================
+notify_oncall_team_declaration = FunctionDeclaration(
+    name="notify_oncall_team",
+    description="Aciona o time de plantão (on-call) enviando um alerta crítico com o ID do build, severidade e resumo do erro.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "build_id": {
+                "type": "string",
+                "description": "ID exclusivo do build que apresentou falha crítica.",
+            },
+            "severity": {
+                "type": "string",
+                "description": "Nível de severidade do incidente (ex: HIGH, CRITICAL).",
+            },
+            "error_summary": {
+                "type": "string",
+                "description": "Resumo detalhado do erro detectado nos logs.",
+            },
+        },
+        "required": ["build_id", "severity", "error_summary"],
+    },
 )
 
 devops_tools = Tool(
     function_declarations=[
-        get_build_logs_decl,
-        trigger_pipeline_retry_decl,
-        notify_oncall_decl
+        get_build_logs_declaration,
+        trigger_pipeline_retry_declaration,
+        notify_oncall_team_declaration,
     ]
 )
+
+
+# Funções Locais (Simuladores das Ferramentas)
+def local_get_build_logs(build_id: str) -> str:
+    log_structured("INFO", f"Buscando logs para o build {build_id}", build_id=build_id)
+    if build_id == "build-101":
+        return "ERROR: Connection timeout to database at 10.0.1.5. Retrying failed after 3 attempts."
+    elif build_id == "build-202":
+        return "ERROR: SyntaxError: invalid syntax in main.py, line 42. x = 10 y = 20"
+    elif build_id == "build-303":
+        return "CRITICAL: Database corruption or unauthorized secret access detected in production cluster. Integrity checks failed."
+    else:
+        return f"ERROR: Unknown error in build {build_id}. Logs show general compilation crash."
+
+
+def local_trigger_pipeline_retry(build_id: str) -> str:
+    log_structured("INFO", f"Disparando reexecução do pipeline para o build {build_id}", build_id=build_id)
+    return f"SUCCESS: Nova execução de pipeline criada para o build {build_id} (ID da nova execução: run-{build_id}-retry)."
+
+
+# ============================================================================
+# ETAPA 2 (10 pts): Implementação da função `local_notify_oncall_team`
+# ============================================================================
+def local_notify_oncall_team(build_id: str, severity: str, error_summary: str) -> str:
+    webhook_secret = os.environ.get("ONCALL_WEBHOOK_SECRET", "mock-webhook-secret")
+    log_structured(
+        "WARNING",
+        f"Alerta On-Call disparado para o build {build_id}",
+        build_id=build_id,
+        severity=severity,
+        error_summary=error_summary,
+    )
+    return f"SUCCESS: Incident ticket successfully opened for build {build_id} with severity {severity}. Webhook notified."
+
+
+@functions_framework.cloud_event
+def triage_agent_event_driven(cloud_event):
+    """
+    Agente de Triagem completo acionado por eventos do Pub/Sub.
+    Verifica idempotência no Firestore, decodifica o evento de falha,
+    roda o loop ReAct e persiste o diagnóstico resultante no Firestore.
+    """
+    pubsub_message = cloud_event.data.get("message", {})
+    if not pubsub_message or "data" not in pubsub_message:
+        log_structured("ERROR", "Payload do Pub/Sub inválido ou vazio.")
+        return
+
+    try:
+        data_str = base64.b64decode(pubsub_message["data"]).decode("utf-8")
+        event_data = json.loads(data_str)
+    except Exception as e:
+        log_structured("ERROR", f"Erro ao decodificar a mensagem do Pub/Sub: {str(e)}")
+        return
+
+    build_id = event_data.get("build_id")
+    if not build_id:
+        log_structured("ERROR", "O campo 'build_id' não foi encontrado na mensagem do Pub/Sub.")
+        return
+
+    db = get_db()
+    doc_ref = db.collection("build_triages").document(build_id)
+
+    # ========================================================================
+    # ETAPA 1 (15 pts): Controle de Idempotência no Firestore
+    # ========================================================================
+    doc_snapshot = doc_ref.get()
+    if doc_snapshot.exists and doc_snapshot.to_dict().get("status") == "TRIAGED":
+        log_structured("INFO", f"Evento duplicado ignorado por idempotência para build_id={build_id}", build_id=build_id)
+        return {"status": "IGNORED_IDEMPOTENT", "build_id": build_id}
+
+    log_structured("INFO", "Iniciando triagem do build", build_id=build_id)
+
+    prompt = f"Por favor, trie o build com ID {build_id}. Busque os logs de erro e tome a acao correspondente."
+
+    system_instruction = (
+        "Você é um engenheiro de DevOps inteligente especialista em triagem de builds que falharam. "
+        "Seu fluxo de trabalho para investigar uma falha é: "
+        "1. Sempre busque os logs do build usando 'get_build_logs'. "
+        "2. Analise os logs recebidos: "
+        "   - Se for um erro transitório de infraestrutura (ex: timeout de banco, falha de rede), chame 'trigger_pipeline_retry' e informe ao usuário. "
+        "   - Se for um erro crítico de produção/segurança/corrupção de dados (CRITICAL), chame 'notify_oncall_team' informando o build_id, a severidade (ex: CRITICAL) e o resumo do erro. "
+        "   - Se for um erro de código de programação ou sintaxe (ex: SyntaxError, NameError), NÃO tente reexecutar. Explique amigavelmente o erro de código e alerte que requer correção humana. "
+        "3. Conclua com uma explicação clara de seu diagnóstico e da ação tomada."
+    )
+
+    try:
+        model = GenerativeModel(
+            model_name="gemini-2.5-flash",
+            tools=[devops_tools],
+            system_instruction=system_instruction,
+        )
+
+        chat = model.start_chat()
+        response = chat.send_message(prompt)
+
+        execution_steps = []
+        max_loops = 5
+        loop_count = 0
+
+        # Loop ReAct
+        while response.candidates[0].function_calls and loop_count < max_loops:
+            loop_count += 1
+            call = response.candidates[0].function_calls[0]
+            name = call.name
+            args = dict(call.args)
+
+            log_structured(
+                "INFO",
+                f"Gemini solicitou ferramenta '{name}'",
+                build_id=build_id,
+                step=loop_count,
+                tool_called=name,
+                arguments=args,
+            )
+
+            if name == "get_build_logs":
+                result = local_get_build_logs(args.get("build_id"))
+            elif name == "trigger_pipeline_retry":
+                result = local_trigger_pipeline_retry(args.get("build_id"))
+            elif name == "notify_oncall_team":
+                result = local_notify_oncall_team(
+                    args.get("build_id"),
+                    args.get("severity"),
+                    args.get("error_summary"),
+                )
+            else:
+                result = f"Erro: Ferramenta {name} desconhecida."
+
+            step_info = {
+                "step": loop_count,
+                "tool_called": name,
+                "arguments": args,
+                "observation": result,
+            }
+            execution_steps.append(step_info)
+
+            response = chat.send_message(
+                Part.from_function_response(name=name, response={"result": result})
+            )
+
+        conclusion = response.text
+        log_structured("INFO", "Triagem concluída pelo agente", build_id=build_id, total_steps=len(execution_steps))
+
+        doc_ref.set(
+            {
+                "build_id": build_id,
+                "conclusion": conclusion,
+                "execution_steps": execution_steps,
+                "total_steps": len(execution_steps),
+                "status": "TRIAGED",
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
+        )
+        return {"status": "TRIAGED", "build_id": build_id}
+
+    except Exception as e:
+        log_structured("ERROR", f"Erro grave durante a execução do agente de triagem: {str(e)}", build_id=build_id)
+        raise
