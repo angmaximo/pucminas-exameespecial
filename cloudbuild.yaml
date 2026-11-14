@@ -1,22 +1,24 @@
 steps:
-  # Etapa 1: Instalação de dependências e execução de testes unitários com unittest
-  - name: 'python:3.10'
+  # Etapa 1: Instalação de dependências e execução dos testes unitários com unittest
+  - name: 'python:3.12'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        echo "=== Instalando dependências ==="
+        echo "=== Instalando dependências do projeto ==="
         pip install --no-cache-dir -r src/requirements.txt
         
         echo "=== Executando testes unitários ==="
         python3 -m unittest test_main.py -v
 
   # Etapa 2: Validação de formatação e sintaxe do Terraform
-  - name: 'hashicorp/terraform:1.5.0'
+  - name: 'hashicorp/terraform:1.6.0'
     entrypoint: 'sh'
     args:
       - '-c'
       - |
-        echo "=== Validando formatação do Terraform ==="
+        echo "=== Validando formatação e sintaxe do Terraform ==="
         cd terraform/
+        terraform init -backend=false
         terraform fmt -check
+        terraform validate

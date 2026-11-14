@@ -30,6 +30,9 @@ if PROJECT_ID:
     vertexai.init(project=PROJECT_ID, location=REGION)
 
 
+# ============================================================================
+# ETAPA 4: Logs Estruturados (JSON em linha única)
+# ============================================================================
 def log_structured(severity: str, message: str, build_id: str = None, **kwargs):
     payload = {
         "severity": severity,
@@ -72,7 +75,7 @@ trigger_pipeline_retry_declaration = FunctionDeclaration(
 )
 
 # ============================================================================
-# ETAPA 2 (15 pts): Declaração da Nova Ferramenta (`notify_oncall_team`)
+# ETAPA 2: Declaração da Nova Ferramenta (`notify_oncall_team`)
 # ============================================================================
 notify_oncall_team_declaration = FunctionDeclaration(
     name="notify_oncall_team",
@@ -114,7 +117,7 @@ def local_get_build_logs(build_id: str) -> str:
     elif build_id == "build-202":
         return "ERROR: SyntaxError: invalid syntax in main.py, line 42. x = 10 y = 20"
     elif build_id == "build-303":
-        return "CRITICAL: Database corruption or unauthorized secret access detected in production cluster. Integrity checks failed."
+        return "CRITICAL: Database corruption or unauthorized secret access detected in production cluster. Integrity checks failed on primary node storage."
     else:
         return f"ERROR: Unknown error in build {build_id}. Logs show general compilation crash."
 
@@ -125,7 +128,7 @@ def local_trigger_pipeline_retry(build_id: str) -> str:
 
 
 # ============================================================================
-# ETAPA 2 (10 pts): Implementação da função `local_notify_oncall_team`
+# ETAPA 2: Implementação da função `local_notify_oncall_team`
 # ============================================================================
 def local_notify_oncall_team(build_id: str, severity: str, error_summary: str) -> str:
     webhook_secret = os.environ.get("ONCALL_WEBHOOK_SECRET", "mock-webhook-secret")
@@ -167,11 +170,15 @@ def triage_agent_event_driven(cloud_event):
     doc_ref = db.collection("build_triages").document(build_id)
 
     # ========================================================================
-    # ETAPA 1 (15 pts): Controle de Idempotência no Firestore
+    # ETAPA 1: Controle de Idempotência no Firestore
     # ========================================================================
     doc_snapshot = doc_ref.get()
     if doc_snapshot.exists and doc_snapshot.to_dict().get("status") == "TRIAGED":
-        log_structured("INFO", f"Evento duplicado ignorado por idempotência para build_id={build_id}", build_id=build_id)
+        log_structured(
+            "INFO",
+            f"Evento duplicado ignorado por idempotência para build_id={build_id}",
+            build_id=build_id,
+        )
         return {"status": "IGNORED_IDEMPOTENT", "build_id": build_id}
 
     log_structured("INFO", "Iniciando triagem do build", build_id=build_id)
@@ -184,7 +191,7 @@ def triage_agent_event_driven(cloud_event):
         "1. Sempre busque os logs do build usando 'get_build_logs'. "
         "2. Analise os logs recebidos: "
         "   - Se for um erro transitório de infraestrutura (ex: timeout de banco, falha de rede), chame 'trigger_pipeline_retry' e informe ao usuário. "
-        "   - Se for um erro crítico de produção/segurança/corrupção de dados (CRITICAL), chame 'notify_oncall_team' informando o build_id, a severidade (ex: CRITICAL) e o resumo do erro. "
+        "   - Se for um erro crítico de produção/segurança/corrupção de dados (CRITICAL), chame 'notify_oncall_team' informando o build_id, a severidade e o resumo do erro. "
         "   - Se for um erro de código de programação ou sintaxe (ex: SyntaxError, NameError), NÃO tente reexecutar. Explique amigavelmente o erro de código e alerte que requer correção humana. "
         "3. Conclua com uma explicação clara de seu diagnóstico e da ação tomada."
     )

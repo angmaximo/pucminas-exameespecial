@@ -39,7 +39,7 @@ resource "google_pubsub_topic" "build_failures" {
 }
 
 # ============================================================================
-# TODO (Etapa 1 - 15 pts): Dead-Letter Queue (DLQ)
+# ETAPA 1: Dead-Letter Queue (DLQ)
 # ============================================================================
 resource "google_pubsub_topic" "build_failures_dlq" {
   name = "build-failures-dlq"
@@ -101,7 +101,7 @@ resource "google_project_iam_member" "firestore_user" {
 }
 
 # ============================================================================
-# TODO (Etapa 3 - 10 pts): Secret Manager + IAM de Menor Privilégio
+# ETAPA 3: Secret Manager + IAM de Menor Privilégio
 # ============================================================================
 resource "google_secret_manager_secret" "oncall_webhook_secret" {
   secret_id = "oncall-webhook-secret"
@@ -132,9 +132,9 @@ resource "google_cloudfunctions2_function" "triage_agent" {
     }
   }
   service_config {
-    # TODO (Etapa 4): Otimização de Cold Start e custos
+    # ETAPA 4: Otimização de Cold Start (min_instance_count = 1 mantém instâncias quentes)
     min_instance_count = 1
-    max_instance_count = 5
+    max_instance_count = 3
     available_memory   = "512Mi"
     timeout_seconds    = 120
     environment_variables = {
@@ -143,7 +143,7 @@ resource "google_cloudfunctions2_function" "triage_agent" {
     }
     service_account_email = google_service_account.agent_sa.email
 
-    # TODO (Etapa 3): Injeção do segredo do Secret Manager
+    # ETAPA 3: Injeção do segredo do Secret Manager como variável de ambiente
     secret_environment_variables {
       key        = "ONCALL_WEBHOOK_SECRET"
       project_id = var.project_id
