@@ -1,8 +1,8 @@
 # Relatório Técnico — Exame Especial: Plataforma Serverless de Triagem Inteligente de Incidentes DevOps
 
-**Aluno(a):** Ângelo Máximo Moreira Silva  
-**Disciplina:** Arquiteturas Serverless e Inteligência Artificial Aplicada  
-**Repositório:** `puc-serveless-ia-event-driven` (Diretório: `exame-especial/`)  
+**Aluno(a):** Angelo Máximo Moreira Silva  
+**Disciplina:** Serverless Computing e Arquiteturas Event-Driven  
+**Repositório:** `pucminas-exameespecial`
 
 ---
 
