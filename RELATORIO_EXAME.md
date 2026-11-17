@@ -160,7 +160,7 @@ Para rodar os testes com mock, as informações referentes ao ID do projeto no G
 
 ---
 
-## 6. Mapeamento dos Arquivos do Projeto (`exame-especial/`)
+## 6. Mapeamento dos Arquivos do Projeto
 
 | Arquivo | Descrição da Responsabilidade |
 | :--- | :--- |
