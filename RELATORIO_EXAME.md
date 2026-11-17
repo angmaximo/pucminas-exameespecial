@@ -145,7 +145,7 @@ OK
 ```
 
 ## Observação  
-Para rodar os testes com mock, as informações referentes ao ID do projeto no GCP foram inseridas como varáveis de ambiente no terminal:  
+Para rodar os testes com mock, as informações referentes ao ID do projeto no GCP foram inseridas como variáveis de ambiente no terminal:  
 
 `export GCP_PROJECT="meu-projeto-real-gcp`  
 `export GCP_REGION="us-central1"`  
