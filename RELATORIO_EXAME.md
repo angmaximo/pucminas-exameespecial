@@ -144,6 +144,12 @@ Ran 5 tests in 0.008s
 OK
 ```
 
+## Observação  
+Para rodar os testes com mock, as informações referentes ao ID do projeto no GCP foram inseridas como varáveis de ambiente no terminal:  
+
+`export GCP_PROJECT="meu-projeto-real-gcp`  
+`export GCP_REGION="us-central1"`  
+
 ### Análise dos Resultados
 
 * **`test_get_build_logs_normal`:** Validou com sucesso a recuperação de logs para builds padrão (como o `build-101`), garantindo que o agente obtenha o payload correto de erro de infraestrutura.
